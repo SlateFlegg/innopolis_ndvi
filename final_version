@@ -1,0 +1,174 @@
+import pandas as pd
+import json
+from shapely.geometry import shape, Polygon
+import re
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import recall_score, precision_score, make_scorer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from catboost import CatBoostClassifier
+import warnings
+warnings.filterwarnings("ignore")
+df = pd.read_csv('train_dataset_train.csv')
+def describe_df(df):
+    print(df.shape)
+    print(df.info())
+    print(df.describe())
+    print(df.sample(5))
+describe_df(df)
+def prepare_data(df):
+    df.drop_duplicates(inplace=True)
+    for col in df:
+        if (sum(df[col].isnull()) >= df.shape[0]*0.01):
+            print(f'В столбце {col} много пустых ячеек {sum(df[col].isnull())/df.shape[0]:.1%}')
+        else:
+            df.dropna(subset=[col], inplace=True)
+        try:
+            threshold_max = df[col].describe()['75%'] + 1.5*(-df[col].describe()['25%'] + df[col].describe()['50%'])
+            max_dist = df[col].describe()['max']
+            threshold_min = df[col].describe()['25%'] - 1.5*(-df[col].describe()['25%'] + df[col].describe()['50%'])
+            min_dist = df[col].describe()['min']
+            coef_threshold = 5
+            if ((abs(max_dist) > abs(coef_threshold*threshold_max)) | (abs(min_dist) > abs(coef_threshold*threshold_min))):
+                print(f'{col} может иметь вылет данных')
+                display(df[col].describe())
+                #df.boxplot(column=[col])
+                #plt.show()
+        except:
+            print(f'{col} is not numeric')
+    return df
+prepare_data(df)
+lon = [] 
+lat = []
+features = df['.geo']
+for feature in features:
+    feature = json.loads(feature) # выделяется каждый отдельный полигон
+    s = shape(feature) 
+    lat.append(s.centroid.x) #высчитывается point центр фигуры, берется координата х
+    lon.append(s.centroid.y) #высчитывается центр фигуры, берется координата у
+df['lon'] = pd.Series(lon)
+df['lat'] = pd.Series(lat)
+crop_name = {0 : 'подсолнечник', 
+             1 : 'картофель', 
+             2 : 'пшеница озимая', 
+             3 : 'гречиха', 
+             4 : 'кукуруза', 
+             5 : 'пшеница яровая', 
+             6 : 'сахараня свекла'}
+def ordering_names (df):    
+    col_names = df.columns
+    col_names = col_names.to_list()
+    days = []
+    for name in col_names:
+        if name not in ['id', 'area', '.geo', 'crop', 'lon', 'lat']:
+            month = re.sub('\S*21-', '', name)
+            month = (int(re.sub('-\d\d', '', month))-1)*31 # получаем количество дней до этого месяца - 31 позволяет избежать задвоений
+            day = int(re.sub('\S*-\d\d-', '', name)) # порядковый номер дня
+            days.append(month+day)
+    days = [day - min(days) for day in days] #смотрим на расстояние между датами 
+    try:
+        for i in ['id', 'area', '.geo', 'lan', 'lat' 'crop']:
+            col_names.remove(i)
+    except:
+        col_names = col_names
+    reverse_names_dict = dict(zip(col_names, days)) #для переименования столбцов
+    names_dict = dict(zip(days, col_names)) # обратный словарь
+    days.sort() # упорядоченные названия позволят обращаться к столбцам по датам
+    col_names = []
+    for d in days:
+        col_names.append(names_dict[d])
+    names_dict=dict(zip(days, col_names))
+    return (days, col_names, names_dict)
+
+days, col_names, names_dict = ordering_names(df)
+print(names_dict)
+def ndvi_crop(df, threshold, names_dict, days):
+    df_tmp = df
+    for i in range(len(days)):
+        date = names_dict[days[i]]
+        try: # избегаем ошибок в краевых стобцах
+            df_tmp.loc[df_tmp[date] < threshold, date] = (df_tmp[names_dict[days[i-1]]] + df_tmp[names_dict[days[i+1]]])/2
+        except:
+            try:
+                df_tmp.loc[df_tmp[date] < threshold, date] = (df_tmp[names_dict[days[i-1]]] + df_tmp[names_dict[days[i-2]]])/2
+            except:
+                df_tmp.loc[df_tmp[date] < threshold, date] = (df_tmp[names_dict[days[i+1]]] + df_tmp[names_dict[days[i+2]]])/2
+    return df_tmp
+def averaging_ndvi(df, col_ndvi, wn):
+    for i in range(wn, len(col_ndvi)-wn):
+        df.loc[col_ndvi[i]] = (df.loc[:, col_ndvi[i-wn]:col_ndvi[i+wn]]).mean().mean()
+    for i in range(0, wn):
+        df.loc[col_ndvi[i]] = df.loc[:,col_ndvi[i]:col_ndvi[i+wn]].mean().mean()
+    for i in range(len(col_ndvi)-wn, len(col_ndvi)):
+        df.loc[col_ndvi[i]] = df.loc[:,col_ndvi[i-wn]:col_ndvi[i]].mean().mean()
+    return df
+df_new = ndvi_crop(df, 0.1, names_dict, days)
+#df_new[col_names] = averaging_ndvi(df_new[col_names], col_names, 4)
+for crop in df_new['crop'].unique():
+    df_plot = df_new[df_new['crop']==crop]
+    df_plot = df_plot.drop(['id', 'area', '.geo', 'lon', 'lat'], axis=1)
+    plt.plot(days, df_plot[col_names].mean()) # в самих знаения уже медианные NDVI на указанные дати
+    df_plot = averaging_ndvi(df_plot, col_names, 7)
+    plt.plot(days, df_plot[col_names].mean()) # в самих знаения уже медианные NDVI на указанные дати
+    plt.title(crop_name[crop])
+    plt.show()
+df_new['first_third'] = 0
+df_new['second_third'] = 0
+df_new['third_third'] = 0
+for d in days:
+    if d < 60:
+        df_new['first_third'] = df_new['first_third'] + df_new[names_dict[d]]
+    elif d <90:
+        df_new['second_third'] = df_new['second_third'] + df_new[names_dict[d]]
+    else:
+        df_new['third_third'] = df_new['third_third'] + df_new[names_dict[d]]
+features = df_new.drop(['crop','.geo'], axis=1) #вместо гео остаются lon & lat
+target = df_new['crop']
+features_train, features_test, target_train, target_test = train_test_split(features, target, test_size=0.15, stratify=target)
+def recall_not_for_two(target, predictions):
+    rec = recall_score(target, predictions, average='micro')
+    return rec
+scorer = make_scorer(recall_not_for_two, greater_is_better=True)
+model = RandomForestClassifier(n_estimators=76, max_depth=48, random_state=179)
+random_search = RandomForestClassifier(n_estimators=92, max_depth=48, random_state=179)
+random_grid = {'max_depth': np.array(range(1,100)),
+               'n_estimators': np.array(range(1,100))}
+n_iter_search = 70
+random_search = RandomizedSearchCV(estimator=model, 
+                                   param_distributions=random_grid, 
+                                   n_iter=n_iter_search, 
+                                   cv=5, 
+                                   scoring=scorer)
+random_search.fit(features_train, target_train)
+pred = random_search.predict(features_test)
+print(recall_score(target_test, pred, average='micro'))
+print(random_search.best_params_)
+test_df = pd.read_csv('test_dataset_test.csv')
+features = test_df['.geo']
+for feature in features:
+    feature = json.loads(feature) # выделяется каждый отдельный полигон
+    s = shape(feature) 
+    lat.append(s.centroid.x) #высчитывается point центр фигуры, берется координата х
+    lon.append(s.centroid.y) #высчитывается центр фигуры, берется координата у
+test_df['lon'] = pd.Series(lon)
+test_df['lat'] = pd.Series(lat)
+days, col_names, names_dict = ordering_names(test_df)
+test_df = test_df.drop('.geo', axis=1)
+df_new = ndvi_crop(test_df, 0.1, names_dict, days)
+#df_new[col_names] = averaging_ndvi(df_new[col_names], col_names, 7)
+df_new['first_third'] = 0
+df_new['second_third'] = 0
+df_new['third_third'] = 0
+for d in days:
+    if d < 60:
+        df_new['first_third'] = df_new['first_third'] + df_new[names_dict[d]]
+    elif d <90:
+        df_new['second_third'] = df_new['second_third'] + df_new[names_dict[d]]
+    else:
+        df_new['third_third'] = df_new['third_third'] + df_new[names_dict[d]]
+predicted = random_search.predict(test_df)
+predicted = zip(test_df['id'].tolist(), predicted)
+predicted = pd.DataFrame(data=predicted, columns=['id', 'crop'])
+print(predicted)
+predicted.to_csv('predicted_v13.csv', index=False)
